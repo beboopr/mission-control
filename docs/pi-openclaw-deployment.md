@@ -38,6 +38,75 @@ It is the companion to [SECURITY-HARDENING.md](./SECURITY-HARDENING.md) and show
 
 ---
 
+
+## ⚠️ Critical: HTTPS is required for the Gateway WebSocket
+
+The MC dashboard generates an Ed25519 device identity in the browser using `WebCrypto.subtle`. **WebCrypto is disabled on plaintext HTTP pages** — only HTTPS, `localhost`, and `127.0.0.1` are recognized as a "secure context". Without WebCrypto, the dashboard cannot sign the gateway connect handshake, and the gateway rejects with:
+
+> `Gateway error: control ui requires device identity (use HTTPS or localhost secure context)`
+
+This means **plain HTTP via the Tailnet IP or LAN IP cannot complete the gateway handshake**, even when the gateway is reachable. The dashboard renders fine, but the gateway pill stays red and the Activity feed logs handshake errors.
+
+### Fix: Tailscale Serve with a Tailscale-issued cert
+
+Tailscale can issue a real Let's Encrypt cert for any tailnet hostname (`*.tailNNNNN.ts.net`) once the HTTPS feature is enabled in the admin console.
+
+1. Open https://login.tailscale.com/admin/dns and click **Enable HTTPS**.
+
+2. On the Pi, issue the cert and stand up Tailscale Serve in front of both MC and the gateway:
+
+   ```bash
+   sudo tailscale cert pi.tailNNNNN.ts.net
+
+   sudo tailscale serve --bg --https=443 --set-path=/   http://127.0.0.1:3030
+   sudo tailscale serve --bg --https=443 --set-path=/gw http://127.0.0.1:18800
+   ```
+
+3. Update `/path/to/mission-control/.env`:
+
+   ```env
+   MC_ALLOWED_HOSTS=localhost,127.0.0.1,::1,192.168.50.100,100.x.x.x,pi.tailNNNNN.ts.net,*.trycloudflare.com
+   NEXT_PUBLIC_GATEWAY_URL=wss://pi.tailNNNNN.ts.net/gw
+   MC_ENABLE_HSTS=1
+   # Keep MC_COOKIE_SECURE unset so per-request detection picks https for the new URL and http elsewhere.
+   ```
+
+4. Mirror to the standalone bundle and restart:
+
+   ```bash
+   cp .env .next/standalone/.env
+   chmod 600 .env .next/standalone/.env
+   pm2 restart mission-control --update-env
+   ```
+
+5. Bookmark `https://pi.tailNNNNN.ts.net/`. That's the new canonical URL for any device on your tailnet.
+
+**Why Caddy isn't used here:** when Tailscale Funnel is enabled, `tailscaled` itself binds the tailnet IP on port 443. Caddy can't bind there. Tailscale Serve replaces Caddy and uses the same cert internally.
+
+### Browser device pairing — first-connect approval
+
+The dashboard requests `operator.admin` scope on first connect. The gateway grants `operator.read` and queues a pending pairing request. Approve once:
+
+```bash
+openclaw devices list                  # shows the pending request id
+openclaw devices approve <id>          # or: --latest
+```
+
+Without this approval the WS closes with code 1008 and the dashboard logs `"Handshake failed on root path. Retrying via /gateway-ws"`.
+
+### Removing the loopback-bypass forwarders (security improvement)
+
+If you previously bound the gateway to the Tailnet/LAN IP (or used `socat` forwarders) to make the WS reachable from a remote browser, you can remove all of that once Tailscale Serve is doing the proxying — the gateway returns to **loopback-only** and trustedProxies stays at `127.0.0.1`:
+
+```bash
+systemctl --user disable --now openclaw-gateway-tailnet-proxy.service
+systemctl --user disable --now openclaw-gateway-lan-proxy.service
+sudo ufw delete allow in on tailscale0 from 100.0.0.0/8 to any port 18800 proto tcp
+sudo ufw delete allow in on eth0       from 192.168.50.0/24 to any port 18800 proto tcp
+```
+
+Verify the gateway is loopback-only again with `sudo lsof -p $(systemctl --user show openclaw-gateway -p MainPID --value) | grep LISTEN`.
+
 ## Prerequisites
 
 - Raspberry Pi OS Bookworm (aarch64), 8 GB RAM
